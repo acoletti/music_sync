@@ -1,0 +1,8 @@
+README.md
+setup.py
+src/file_processor.egg-info/PKG-INFO
+src/file_processor.egg-info/SOURCES.txt
+src/file_processor.egg-info/dependency_links.txt
+src/file_processor.egg-info/entry_points.txt
+src/file_processor.egg-info/requires.txt
+src/file_processor.egg-info/top_level.txt

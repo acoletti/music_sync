@@ -1,4 +1,6 @@
 import hashlib
+import os
+import time
 from pathlib import Path
 from typing import List, Optional, Set, Dict, Type
 from abc import ABC, abstractmethod
@@ -26,6 +28,8 @@ class MediaFactory(ABC):
     """Base factory interface for creating media info objects."""
     def __init__(self):
         self._supported_formats: Set[str] = set()
+        self._max_retries = 3
+        self._retry_delay = 2  # Increased delay for network shares
 
     @abstractmethod
     def create(self, path: Path, fast: bool = False) -> Optional[MediaInfo]:
@@ -42,15 +46,43 @@ class MediaFactory(ABC):
 
     def _is_supported_file(self, file_path: Path) -> bool:
         """Check if a file is of a supported format."""
-        return file_path.is_file() and file_path.suffix.lower() in self._supported_formats
+        for attempt in range(self._max_retries):
+            try:
+                if not os.access(file_path, os.R_OK):
+                    raise PermissionError(f"No read access to {file_path}")
+                return file_path.is_file() and file_path.suffix.lower() in self._supported_formats
+            except PermissionError as e:
+                if attempt < self._max_retries - 1:
+                    print(f"Warning: Permission denied for file {file_path}, retrying... ({attempt + 1}/{self._max_retries})")
+                    time.sleep(self._retry_delay)
+                    continue
+                print(f"Warning: Permission denied for file {file_path} after {self._max_retries} attempts: {e}")
+                print("If this is a network share, ensure you have read access")
+                return False
+            except Exception as e:
+                print(f"Warning: Error checking file {file_path}: {e}")
+                return False
+        return False
 
-    def _calculate_file_hash(self, file_path: Path, block_size: int = 65536) -> str:
+    def _get_file_size(self, file_path: Path) -> Optional[int]:
+        """Get file size with retry logic."""
+        for attempt in range(self._max_retries):
+            try:
+                if not os.access(file_path, os.R_OK):
+                    raise PermissionError(f"No read access to {file_path}")
+                return file_path.stat().st_size
+            except (PermissionError, OSError) as e:
+                if attempt < self._max_retries - 1:
+                    print(f"Warning: Error getting file size for {file_path}, retrying... ({attempt + 1}/{self._max_retries})")
+                    time.sleep(self._retry_delay)
+                    continue
+                print(f"Warning: Could not get file size for {file_path}: {e}")
+                return None
+        return None
+
+    def _calculate_file_hash(self, file_path: Path, block_size: int = 65536) -> Optional[str]:
         """Calculate SHA-256 hash of a file."""
-        file_hash = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            for block in iter(lambda: f.read(block_size), b''):
-                file_hash.update(block)
-        return file_hash.hexdigest()
+        return FileFactory.calculate_file_hash(file_path, block_size)
 
 class AudioFactory(MediaFactory):
     """Factory for creating audio file info objects."""
@@ -65,12 +97,22 @@ class AudioFactory(MediaFactory):
                 return None
 
             format = AudioFormat(path.suffix.lower())
+            file_size = self._get_file_size(path)
+            if file_size is None:
+                print(f"Warning: Could not get file size for {path}, skipping file")
+                return None
+
+            file_hash = None if fast else self._calculate_file_hash(path)
+            if not fast and file_hash is None:
+                print(f"Warning: Could not calculate hash for {path}, skipping file")
+                return None
+
             return AudioInfo(
                 path=path,
                 name=path.stem,
-                size=path.stat().st_size,
+                size=file_size,
                 normalized_name=normalize_track_name(path.stem),
-                hash=None if fast else self._calculate_file_hash(path),
+                hash=file_hash,
                 format=format
             )
         except (PermissionError, OSError) as e:
@@ -90,12 +132,22 @@ class VideoFactory(MediaFactory):
                 return None
 
             format = VideoFormat(path.suffix.lower())
+            file_size = self._get_file_size(path)
+            if file_size is None:
+                print(f"Warning: Could not get file size for {path}, skipping file")
+                return None
+
+            file_hash = None if fast else self._calculate_file_hash(path)
+            if not fast and file_hash is None:
+                print(f"Warning: Could not calculate hash for {path}, skipping file")
+                return None
+
             return VideoInfo(
                 path=path,
                 name=path.stem,
-                size=path.stat().st_size,
+                size=file_size,
                 normalized_name=normalize_track_name(path.stem),
-                hash=None if fast else self._calculate_file_hash(path),
+                hash=file_hash,
                 format=format
             )
         except (PermissionError, OSError) as e:
@@ -115,12 +167,22 @@ class DocumentFactory(MediaFactory):
                 return None
 
             format = DocumentFormat(path.suffix.lower())
+            file_size = self._get_file_size(path)
+            if file_size is None:
+                print(f"Warning: Could not get file size for {path}, skipping file")
+                return None
+
+            file_hash = None if fast else self._calculate_file_hash(path)
+            if not fast and file_hash is None:
+                print(f"Warning: Could not calculate hash for {path}, skipping file")
+                return None
+
             return DocumentInfo(
                 path=path,
                 name=path.stem,
-                size=path.stat().st_size,
+                size=file_size,
                 normalized_name=normalize_track_name(path.stem),
-                hash=None if fast else self._calculate_file_hash(path),
+                hash=file_hash,
                 format=format
             )
         except (PermissionError, OSError) as e:
@@ -136,11 +198,22 @@ class MediaFactoryRegistry(FileFactoryRegistry):
             FileType.VIDEO: DefaultVideoFactory(),
             FileType.DOCUMENT: DefaultDocumentFactory()
         }
+        # Map MediaType to FileType
+        self._media_type_map = {
+            MediaType.AUDIO: FileType.AUDIO,
+            MediaType.VIDEO: FileType.VIDEO,
+            MediaType.DOCUMENT: FileType.DOCUMENT
+        }
 
-    def get_factory(self, media_type: MediaType):
+    def get_factory(self, media_type: Optional[MediaType] = None) -> Optional[FileFactory]:
         """Get the factory for a specific media type."""
-        return self._factories[media_type]
+        if media_type is None:
+            return None
+        file_type = self._media_type_map.get(media_type)
+        if file_type is None:
+            return None
+        return self._factories.get(file_type)
 
-    def get_all_factories(self) -> List:
+    def get_all_factories(self) -> List[FileFactory]:
         """Get all registered factories."""
         return list(self._factories.values()) 

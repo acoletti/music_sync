@@ -1,0 +1,2 @@
+[console_scripts]
+file-processor = file_processor.__main__:main

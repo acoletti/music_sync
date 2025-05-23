@@ -48,7 +48,6 @@ class AbstractProcessor(ABC, Generic[InfoType]):
     def __init__(self, factory: BaseFactory[InfoType], file_type_enum: Type[Enum]):
         self._factory = factory
         self._file_type_enum = file_type_enum
-        self._allowed_extensions = {item.value for item in file_type_enum}
 
     def normalize_name(self, name: str) -> str:
         """Normalize file name by removing common prefixes and suffixes."""
@@ -81,8 +80,18 @@ class AbstractProcessor(ABC, Generic[InfoType]):
         ), suffixes, name)
 
     def _is_relevant_file(self, file_path: Path) -> bool:
-        """Check if a file is of the relevant type based on its extension."""
-        return file_path.is_file() and file_path.suffix.lower() in self._allowed_extensions
+        """Check if a file is of the relevant type."""
+        try:
+            if not file_path.exists():
+                print(f"Warning: Path does not exist: {file_path}")
+                return False
+            if file_path.is_dir():
+                print(f"Warning: Path is a directory, not a file: {file_path}")
+                return False
+            return file_path.suffix.lower() in {fmt.value for fmt in self._file_type_enum}
+        except Exception as e:
+            print(f"Warning: Error checking file {file_path}: {e}")
+            return False
 
     def process_file(self, file_path: Path) -> Optional[InfoType]:
         """Process a file and return its info using the provided factory."""
@@ -94,21 +103,25 @@ class AbstractProcessor(ABC, Generic[InfoType]):
         """Get all files of the processor's type from a folder."""
         files: List[InfoType] = []
         if not folder_path.is_dir():
-            # print(f"Warning: {folder_path} is not a directory or does not exist.")
+            print(f"Warning: Path is not a directory: {folder_path}")
             return files
         try:
             for file_path in folder_path.rglob('*'):
                 if self._is_relevant_file(file_path):
-                    processed_file = self.process_file(file_path) # process_file already checks _is_relevant_file
-                    if processed_file:
-                        files.append(processed_file)
-        except PermissionError:
-            # print(f"Warning: Permission denied for {folder_path}")
-            pass # Or handle more gracefully
+                    try:
+                        processed_file = self.process_file(file_path)
+                        if processed_file:
+                            files.append(processed_file)
+                    except PermissionError as e:
+                        print(f"Warning: Permission denied for file {file_path}: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"Warning: Error processing file {file_path}: {e}")
+                        continue
+        except PermissionError as e:
+            print(f"Warning: Permission denied for folder {folder_path}: {e}")
+            print("If this is a network share, ensure you have read access")
         except Exception as e:
-            # print(f"An unexpected error occurred while processing {folder_path}: {e}")
-            pass # Or handle more gracefully
+            print(f"Warning: Error accessing folder {folder_path}: {e}")
 
-        # Ensure all items in the list are of InfoType, not None
-        # The comprehension in process_file and the check for processed_file should handle this
         return files 

@@ -30,6 +30,8 @@ from src.file_processor.factories.document import DefaultDocumentFactory
 from src.file_processor.factories.video import DefaultVideoFactory
 from src.file_processor.factories.file import FileFactory
 from src.file_processor.commands.preview import PreviewCommand
+from src.file_processor.models.media import MediaType
+from src.file_processor.media_processor import MediaProcessor
 
 @dataclass
 class FolderInfo:
@@ -192,7 +194,8 @@ class FileProcessorConfig:
     """Configuration manager for file processing."""
     def __init__(self, file_root: Path):
         self.file_root = file_root
-        self.config_dir = self.file_root / '.file_processor'
+        # Use local app data directory for configuration
+        self.config_dir = Path(os.path.expanduser("~")) / ".music_processor"
         self.progress_file = self.config_dir / 'progress.json'
         self.config_file = self.config_dir / 'config.json'
         self.processed_folders: Set[str] = set()
@@ -203,6 +206,7 @@ class FileProcessorConfig:
     def ensure_config_dir(self) -> None:
         """Create the configuration directory if it doesn't exist."""
         try:
+            # Create config directory in user's home directory
             self.config_dir.mkdir(exist_ok=True)
             print(f"Configuration directory created at: {self.config_dir}")
             
@@ -211,7 +215,8 @@ class FileProcessorConfig:
                 print("Configuration file initialized.")
         except Exception as e:
             print(f"Error creating configuration directory: {e}")
-            raise
+            print("Using in-memory configuration only.")
+            # Don't raise the exception, just continue without persistent storage
 
     def load_progress(self) -> None:
         """Load the progress from the progress file."""
@@ -224,6 +229,7 @@ class FileProcessorConfig:
                 print(f"Loaded progress for {len(self.processed_folders)} processed folders.")
             except Exception as e:
                 print(f"Error loading progress file: {e}")
+                print("Starting with empty progress.")
                 self.processed_folders = set()
         else:
             print("No progress file found. Starting fresh.")
@@ -240,6 +246,7 @@ class FileProcessorConfig:
             print(f"Progress saved: {len(self.processed_folders)} folders processed.")
         except Exception as e:
             print(f"Error saving progress file: {e}")
+            print("Progress will not be persisted.")
 
     def save_config(self, config_data: ProcessingStats) -> None:
         """Save configuration data."""
@@ -249,7 +256,7 @@ class FileProcessorConfig:
             print("Configuration saved successfully.")
         except Exception as e:
             print(f"Error saving configuration: {e}")
-            # Decide if we want to raise here or handle
+            print("Configuration will not be persisted.")
 
     def load_config(self) -> ProcessingStats:
         """Load configuration data."""
@@ -264,19 +271,21 @@ class FileProcessorConfig:
 
     def is_folder_processed(self, folder_path: Path) -> bool:
         """Check if a folder has already been processed."""
-        return str(folder_path) in self.processed_folders
+        # Convert network path to a string representation that can be stored
+        folder_str = str(folder_path)
+        return folder_str in self.processed_folders
 
     def mark_folder_processed(self, folder_path: Path) -> None:
         """Mark a folder as processed."""
-        self.processed_folders.add(str(folder_path))
+        # Convert network path to a string representation that can be stored
+        folder_str = str(folder_path)
+        self.processed_folders.add(folder_str)
         self.save_progress()
 
     def update_stats(self, cleaned_count: int = 0) -> None:
         """Update processing statistics."""
         config = self.load_config()
         config.last_run = datetime.now().isoformat()
-        # Assuming total_processed is managed elsewhere or by number of groups
-        # config.total_processed = len(self.processed_folders) # This might not be right if reset
         config.total_cleaned += cleaned_count
         self.save_config(config)
 
@@ -299,18 +308,27 @@ def remove_common_words(s: str) -> str:
     """Remove common words that might differ between versions."""
     return re.sub(r'\b(disc|cd|disc\s*\d+|cd\s*\d+)\b', '', s)
 
-def are_strings_similar(a: str, b: str, threshold: float = 0.85) -> bool:
-    """Compare two strings and return True if they are similar enough."""
-    a = normalize_string(a)
-    b = normalize_string(b)
+def are_strings_similar(a: str, b: str, threshold: float = 0.85, fast_mode: bool = False) -> bool:
+    """Check if two strings are similar."""
+    if fast_mode:
+        # In fast mode, use a lower threshold and skip some checks
+        threshold = 0.75
+        # Skip special character removal and common word removal
+        a_norm = normalize_string(a)
+        b_norm = normalize_string(b)
+        return are_strings_similar_by_ratio(a_norm, b_norm, threshold)
     
-    if is_one_contained_in_other(a, b):
+    # Normal mode - full processing
+    a_norm = normalize_string(a)
+    b_norm = normalize_string(b)
+    
+    if are_strings_identical(a_norm, b_norm):
         return True
-        
-    if are_strings_identical(a, b):
+    
+    if is_one_contained_in_other(a_norm, b_norm):
         return True
-        
-    return are_strings_similar_by_ratio(a, b, threshold)
+    
+    return are_strings_similar_by_ratio(a_norm, b_norm, threshold)
 
 def is_one_contained_in_other(a: str, b: str) -> bool:
     """Check if one string is contained within the other."""
@@ -445,84 +463,134 @@ def get_new_folders_from_batch(batch_results: List[Tuple[Path, Path]],
             processed.add(path2)
     return new_folders
 
-def is_likely_same_content(path1: Path, path2: Path) -> bool:
-    """Verify if two folders likely contain the same content."""
-    files1 = get_folder_files(path1)[:5]
-    files2 = get_folder_files(path2)[:5]
+def is_likely_same_content(path1: Path, path2: Path, fast_mode: bool = False) -> bool:
+    """Check if two paths are likely to contain the same content."""
+    # First check if both paths are directories
+    if path1.is_dir() and path2.is_dir():
+        # For directories, compare file counts and sizes
+        try:
+            count1 = count_files_in_folder(path1)
+            count2 = count_files_in_folder(path2)
+            if count1 != count2:
+                return False
+            
+            # In fast mode, just compare file counts
+            if fast_mode:
+                return True
+            
+            # Compare folder sizes
+            size1 = get_folder_size(path1)
+            size2 = get_folder_size(path2)
+            if size1 != size2:
+                return False
+            
+            # Compare folder names
+            return are_strings_similar(path1.name, path2.name)
+        except (PermissionError, OSError) as e:
+            print(f"Warning: Error comparing directories {path1} and {path2}: {e}")
+            return False
     
-    if set(files1) & set(files2):
-        return True
-    
-    size1 = get_folder_size(path1)
-    size2 = get_folder_size(path2)
-    count1 = count_files_in_folder(path1)
-    count2 = count_files_in_folder(path2)
-    
-    if max(size1, size2) == 0 or max(count1, count2) == 0:
+    # If one is a directory and the other isn't, they're not the same
+    if path1.is_dir() != path2.is_dir():
         return False
-
-    size_ratio = min(size1, size2) / max(size1, size2)
-    count_ratio = min(count1, count2) / max(count1, count2)
     
-    return size_ratio > 0.8 and count_ratio > 0.8
+    # For files, proceed with normal comparison
+    if fast_mode:
+        # In fast mode, only check file sizes and names
+        if get_file_size(path1) != get_file_size(path2):
+            return False
+        return are_strings_similar(path1.name, path2.name, fast_mode=True)
+    
+    # Normal mode - full content check
+    try:
+        if get_file_size(path1) != get_file_size(path2):
+            return False
+        
+        # Calculate hashes only if sizes match
+        hash1 = calculate_file_hash_safe(path1, 65536)
+        hash2 = calculate_file_hash_safe(path2, 65536)
+        
+        if hash1 and hash2:
+            return hash1 == hash2
+        
+        # Fallback to name similarity if hashing fails
+        return are_strings_similar(path1.name, path2.name)
+    except Exception as e:
+        print(f"Error comparing {path1} and {path2}: {e}")
+        return False
 
 def similar(path1: Path, path2: Path) -> bool:
     """Determine if two folders are similar."""
     return is_likely_same_content(path1, path2)
 
-def find_similar_folders(root_path: Path) -> List[List[Path]]:
-    """Find groups of similar folders in the given root path."""
-    print("\n=== Scanning for similar folders ===")
+def find_similar_folders(root_path: Path, fast_mode: bool = False) -> List[List[Path]]:
+    """Find groups of similar folders."""
+    print("Scanning for similar folders...")
     
-    folder_iterator = FolderIterator(root_path)
-    folder_iterator.load_folders()
+    # Get all folders
+    folders = []
+    for item in os.listdir(root_path):
+        item_path = root_path / item
+        if item_path.is_dir():
+            folders.append(FolderInfo(
+                path=item_path,
+                name=item,
+                size=get_folder_size(item_path),
+                file_count=count_files_in_folder(item_path),
+                files=get_folder_files(item_path)
+            ))
     
-    if not folder_iterator._folders:
-        print("No folders found to analyze.")
+    if not folders:
         return []
-        
-    print(f"\nFound {len(folder_iterator._folders)} folders to analyze")
-    print("\n=== Analyzing folder similarities ===")
     
-    num_workers, chunk_size = calculate_worker_settings(len(folder_iterator._folders))
-    folder_chunks = create_folder_chunks(folder_iterator._folders, chunk_size)
-    total_comparisons = calculate_total_comparisons(folder_iterator._folders, chunk_size)
+    # Calculate worker settings
+    num_workers, chunk_size = calculate_worker_settings(len(folders), fast_mode)
+    print(f"Using {num_workers} workers with chunk size {chunk_size}")
     
-    print(f"\nProcessing folders using {num_workers} workers...")
+    # Create folder chunks for parallel processing
+    folder_chunks = create_folder_chunks(folders, chunk_size)
+    
+    # Calculate total comparisons for progress bar
+    total_comparisons = calculate_total_comparisons(folders, chunk_size)
+    
     similar_groups = []
     processed = set()
     
-    with tqdm(total=total_comparisons, desc="Comparing folders") as pbar:
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with tqdm(total=total_comparisons, desc="Comparing folders") as pbar:
             for chunk in folder_chunks:
-                results = process_folder_chunk(chunk, folder_iterator._folders, chunk_size, processed, executor, pbar)
-                for group in results:
-                    similar_groups.append(group)
-                pbar.update(len(chunk))
+                results = process_folder_chunk(chunk, folders, chunk_size, processed, executor, pbar)
+                if results:
+                    similar_groups.extend(results)
     
-    print(f"\nFound {len(similar_groups)} groups of similar folders")
     return similar_groups
 
 def find_duplicate_tracks_across_folders(folder_group: List[Path]) -> Dict[str, List[Path]]:
     """Find duplicate tracks across a group of folders."""
-    track_iterator = TrackIterator(folder_group)
-    track_iterator.load_tracks()
+    try:
+        track_iterator = TrackIterator(folder_group)
+        track_iterator.load_tracks()
 
-    tracks_by_name: Dict[str, List[Path]] = defaultdict(list)
-    for track_info in track_iterator:
-        # Assuming track_info has a normalized_name and path attribute
-        tracks_by_name[track_info.normalized_name].append(track_info.path)
+        tracks_by_name: Dict[str, List[Path]] = defaultdict(list)
+        for track_info in track_iterator:
+            # Assuming track_info has a normalized_name and path attribute
+            tracks_by_name[track_info.normalized_name].append(track_info.path)
 
-    duplicate_tracks: Dict[str, List[Path]] = {}
-    for name, paths in tracks_by_name.items():
-        if len(paths) > 1:
-            # Further check if these are actual duplicates (e.g. by hash or size)
-            # For now, just matching by name
-            # We might want to ensure they are from different original folders if folder_group can contain subfolders of a processed unit
-            unique_parent_folders = {p.parent for p in paths}
-            if len(unique_parent_folders) > 1: # Ensure paths are from different main folders in the group
-                 duplicate_tracks[name] = paths
-    return duplicate_tracks
+        duplicate_tracks: Dict[str, List[Path]] = {}
+        for name, paths in tracks_by_name.items():
+            if len(paths) > 1:
+                # Further check if these are actual duplicates (e.g. by hash or size)
+                # For now, just matching by name
+                # We might want to ensure they are from different original folders if folder_group can contain subfolders of a processed unit
+                unique_parent_folders = {p.parent for p in paths}
+                if len(unique_parent_folders) > 1: # Ensure paths are from different main folders in the group
+                     duplicate_tracks[name] = paths
+        return duplicate_tracks
+    except PermissionError as e:
+        print(f"\nError: Permission denied while scanning for duplicates: {e}")
+        print("Try running the script as administrator")
+        print("If this is a network share, ensure you have read access")
+        raise
 
 def preview_changes(root_path: Path) -> List[str]:
     """Preview changes that would be made to the music folder."""
@@ -567,10 +635,10 @@ def preview_changes(root_path: Path) -> List[str]:
     print("\n=== Preview complete ===")
     return changes
 
-def get_music_folder_path(args: argparse.Namespace) -> Optional[Path]:
+def get_music_folder_path(source_dir_arg: Optional[str]) -> Optional[Path]:
     """Get the music folder path from arguments or default location."""
-    if args.path:
-        music_folder = Path(args.path).resolve()
+    if source_dir_arg:
+        music_folder = Path(source_dir_arg).resolve()
         if not music_folder.exists():
             print(f"Error: Path '{music_folder}' does not exist.")
             return None
@@ -581,7 +649,7 @@ def get_music_folder_path(args: argparse.Namespace) -> Optional[Path]:
     
     d_drive = Path('/mnt/d')
     if not d_drive.exists():
-        print("D: drive not found. Please make sure it's properly mounted or use --path to specify a different location.")
+        print("D: drive not found. Please make sure it's properly mounted or use --source-dir to specify a different location.")
         return None
 
     for item in os.listdir(d_drive):
@@ -590,7 +658,7 @@ def get_music_folder_path(args: argparse.Namespace) -> Optional[Path]:
             if music_folder.exists():
                 return music_folder
 
-    print("Music folder not found in D: drive. Please use --path to specify the music folder location.")
+    print("Music folder not found in D: drive. Please use --source-dir to specify the music folder location.")
     return None
 
 class Command(ABC):
@@ -606,19 +674,25 @@ class Command(ABC):
         pass
 
 class CleanupCommand(Command):
-    """Command for cleaning up music files."""
+    """Command for cleaning up media files."""
     def add_to_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument('-y', '--yes', action='store_true', 
                           help='Automatically answer yes to all prompts')
         parser.add_argument('--reset', action='store_true',
                           help='Reset progress and start fresh')
-        parser.add_argument('--path', type=str,
-                          help='Path to the music folder (absolute or relative)')
+        parser.add_argument('--source-dir', type=str,
+                          help='Path to the media folder (absolute or relative)')
+        parser.add_argument('--fast', action='store_true',
+                          help='Run in fast mode with less thorough checks')
+        parser.add_argument('--media-type', type=str,
+                          help='Type of media to process (AUDIO, VIDEO, DOCUMENT)')
 
     def execute(self, args: argparse.Namespace) -> None:
         print("=== Starting music folder cleanup ===")
+        if args.fast:
+            print("Running in fast mode - using less thorough checks")
         
-        music_folder = get_music_folder_path(args)
+        music_folder = get_music_folder_path(args.source_dir)
         if not music_folder:
             return
 
@@ -677,16 +751,58 @@ def process_music_folder(music_folder: Path, args: argparse.Namespace) -> Proces
     if args.reset:
         reset_processing_progress(config)
     
-    audio_processor = AudioProcessor()
-    document_processor = DocumentProcessor()
-    video_processor = VideoProcessor()
+    # Create media processor for the specified type
+    media_type = None
+    if args.media_type:
+        try:
+            media_type = MediaType[args.media_type.upper()]
+        except KeyError:
+            print(f"Invalid media type: {args.media_type}")
+            print("Valid types are: AUDIO, VIDEO, DOCUMENT")
+            return ProcessingResult([], 0, 0)
     
-    similar_groups = find_similar_folders(music_folder)
-    if not similar_groups:
-        print("No similar folders found!")
+    media_processor = MediaProcessor(media_type)
+    
+    # Get all media files
+    files = media_processor.get_files(music_folder)
+    if not files:
+        print("No media files found!")
         return ProcessingResult([], 0, 0)
     
-    return process_similar_groups(similar_groups, config, args.yes)
+    print(f"\nFound {len(files)} media files")
+    
+    # Find duplicates
+    duplicates = media_processor.get_duplicates(files, fast=args.fast)
+    if not duplicates:
+        print("No duplicates found!")
+        return ProcessingResult([], len(files), 0)
+    
+    print(f"\nFound {len(duplicates)} groups of duplicate files")
+    
+    # Process duplicates
+    cleaned_count = 0
+    for name, group in duplicates.items():
+        print(f"\nProcessing group: {name}")
+        print(f"Found {len(group)} duplicate files")
+        
+        # Sort by size (largest first)
+        group.sort(key=lambda x: x.size, reverse=True)
+        
+        # Keep the largest file
+        keep_file = group[0]
+        print(f"Keeping: {keep_file.path} ({keep_file.size} bytes)")
+        
+        # Remove others
+        for file in group[1:]:
+            if args.yes or input(f"Remove {file.path} ({file.size} bytes)? [y/N] ").lower() == 'y':
+                try:
+                    file.path.unlink()
+                    print(f"Deleted: {file.path}")
+                    cleaned_count += 1
+                except Exception as e:
+                    print(f"Error removing {file.path}: {e}")
+    
+    return ProcessingResult([], len(files), cleaned_count)
 
 def reset_processing_progress(config: FileProcessorConfig) -> None:
     """Reset the processing progress."""
@@ -719,11 +835,17 @@ def display_processing_results(result: ProcessingResult) -> None:
     print(f"Total items cleaned: {result.cleaned_count}")
     print("\n=== Cleanup complete ===")
 
-def calculate_worker_settings(folder_count: int) -> Tuple[int, int]:
+def calculate_worker_settings(folder_count: int, fast_mode: bool = False) -> Tuple[int, int]:
     """Calculate optimal number of workers and chunk size."""
     num_cores = multiprocessing.cpu_count()
-    num_workers = min(num_cores * 4, 60)  # Cap at 60 workers for Windows
-    chunk_size = max(1, folder_count // (num_workers * 8))
+    if fast_mode:
+        # In fast mode, use fewer workers but larger chunks
+        num_workers = min(num_cores * 2, 30)  # Cap at 30 workers for Windows
+        chunk_size = max(1, folder_count // (num_workers * 4))
+    else:
+        # Normal mode - more workers, smaller chunks
+        num_workers = min(num_cores * 4, 60)  # Cap at 60 workers for Windows
+        chunk_size = max(1, folder_count // (num_workers * 8))
     return num_workers, chunk_size
 
 def create_folder_chunks(folders: List[FolderInfo], chunk_size: int) -> List[List[FolderInfo]]:
@@ -763,7 +885,15 @@ def process_and_clean_group(folder_group: List[Path], config: FileProcessorConfi
     print(f"\nKeeping folder: {keep_folder} with {folder_sizes[0][1]} files")
     
     # Find duplicate tracks across folders
-    duplicate_tracks = find_duplicate_tracks_across_folders(folder_group)
+    try:
+        duplicate_tracks = find_duplicate_tracks_across_folders(folder_group)
+    except PermissionError as e:
+        print(f"\nError: Permission denied while scanning folders: {e}")
+        print("Try the following:")
+        print("1. Run the script as administrator")
+        print("2. Check network share permissions")
+        print("3. Ensure you have write access to the network share")
+        return ProcessingResult([folder_group], 0, 0)
     
     if duplicate_tracks:
         print("\nDuplicate tracks found:")
@@ -777,9 +907,18 @@ def process_and_clean_group(folder_group: List[Path], config: FileProcessorConfi
             for file_path in file_paths[1:]:
                 if auto_yes or input(f"    Remove {file_path} ({get_file_size(file_path)} bytes)? [y/N] ").lower() == 'y':
                     try:
-                        file_path.unlink()
-                        print(f"    Removed: {file_path}")
-                        cleaned_count += 1
+                        # Check if file is read-only
+                        if os.access(file_path, os.W_OK):
+                            file_path.unlink()
+                            print(f"    Removed: {file_path}")
+                            cleaned_count += 1
+                        else:
+                            print(f"    Error: No write permission for {file_path}")
+                            print("    Try running the script as administrator or check file permissions")
+                    except PermissionError:
+                        print(f"    Error: Permission denied for {file_path}")
+                        print("    Try running the script as administrator")
+                        print("    If this is a network share, ensure you have write access")
                     except Exception as e:
                         print(f"    Error removing {file_path}: {e}")
     
@@ -788,28 +927,38 @@ def process_and_clean_group(folder_group: List[Path], config: FileProcessorConfi
         if count_files_in_folder(folder_path) == 0:
             if auto_yes or input(f"\nRemove empty folder {folder_path}? [y/N] ").lower() == 'y':
                 try:
-                    # folder_path.rmdir() # Old method, only for empty dirs
-                    shutil.rmtree(folder_path) # Use shutil.rmtree to remove recursively
-                    print(f"Removed folder: {folder_path}") # Updated message
-                    cleaned_count += 1
+                    # Check if directory is writable
+                    if os.access(folder_path, os.W_OK):
+                        shutil.rmtree(folder_path)
+                        print(f"Removed folder: {folder_path}")
+                        cleaned_count += 1
+                    else:
+                        print(f"Error: No write permission for folder {folder_path}")
+                        print("Try running the script as administrator or check folder permissions")
+                except PermissionError:
+                    print(f"Error: Permission denied for folder {folder_path}")
+                    print("Try running the script as administrator")
+                    print("If this is a network share, ensure you have write access")
                 except Exception as e:
                     print(f"Error removing folder {folder_path}: {e}")
     
     # After removing individual files, re-check folders that were not initially empty
-    # and remove them if they have become empty.
-    for folder_path, _ in folder_sizes[1:]: # Iterate through all non-kept folders
+    for folder_path, _ in folder_sizes[1:]:
         if folder_path.exists() and count_files_in_folder(folder_path) == 0:
-            # No need to ask again if auto_yes was true, but for safety, 
-            # if not auto_yes, this prompts for folders that became empty after track deletions.
-            # Consider if this second prompt is desired or if initial prompt for non-empty folders is enough.
-            # For now, let's assume if it's empty now, it's safe to remove if confirmed.
             if auto_yes or input(f"\nRemove folder {folder_path} (now empty after track deletions)? [y/N] ").lower() == 'y':
                 try:
-                    shutil.rmtree(folder_path)
-                    print(f"Removed folder (became empty): {folder_path}")
-                    cleaned_count += 1 # This might double count if already counted as an "empty folder" before track deletion
-                                      # The logic for cleaned_count for folders needs review if precise counts are critical.
-                                      # However, for functionality, this ensures removal.
+                    # Check if directory is writable
+                    if os.access(folder_path, os.W_OK):
+                        shutil.rmtree(folder_path)
+                        print(f"Removed folder (became empty): {folder_path}")
+                        cleaned_count += 1
+                    else:
+                        print(f"Error: No write permission for folder {folder_path}")
+                        print("Try running the script as administrator or check folder permissions")
+                except PermissionError:
+                    print(f"Error: Permission denied for folder {folder_path}")
+                    print("Try running the script as administrator")
+                    print("If this is a network share, ensure you have write access")
                 except Exception as e:
                     print(f"Error removing folder (became empty) {folder_path}: {e}")
 

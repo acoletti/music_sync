@@ -21,10 +21,10 @@ class Command(ABC):
         """Execute the command."""
         pass
 
-    def get_music_folder_path(self, args: argparse.Namespace) -> Optional[Path]:
+    def get_music_folder_path(self, source_dir_arg: Optional[str]) -> Optional[Path]:
         """Get the music folder path from arguments or default location."""
-        if args.path:
-            music_folder = Path(args.path).resolve()
+        if source_dir_arg:
+            music_folder = Path(source_dir_arg).resolve()
             if not music_folder.exists():
                 print(f"Error: Path '{music_folder}' does not exist.")
                 return None
@@ -35,7 +35,7 @@ class Command(ABC):
         
         d_drive = Path('/mnt/d')
         if not d_drive.exists():
-            print("D: drive not found. Please make sure it's properly mounted or use --path to specify a different location.")
+            print("D: drive not found. Please make sure it's properly mounted or use --source-dir to specify a different location.")
             return None
 
         for item in os.listdir(d_drive):
@@ -44,5 +44,5 @@ class Command(ABC):
                 if music_folder.exists():
                     return music_folder
 
-        print("Music folder not found in D: drive. Please use --path to specify the music folder location.")
+        print("Music folder not found in D: drive. Please use --source-dir to specify the music folder location.")
         return None 
