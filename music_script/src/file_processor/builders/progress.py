@@ -73,16 +73,3 @@ class ProgressManager:
         if self._current_progress:
             self._current_progress.close()
             self._current_progress = None 
-
-results = process_folder_chunk(chunk, folder_iterator._folders, chunk_size, processed, executor, pbar)
-for group in results:
-    similar_groups.append(group)
-pbar.update(len(chunk))
-
-for folder_info in remaining_folders:
-    path2 = folder_info.path
-    if path2 in processed:
-        continue
-    if similar(path1, path2):
-        similar_folders.append((path1, path2))
-    pbar.update(1) 
