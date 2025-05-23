@@ -1,0 +1,8 @@
+README.md
+setup.py
+src/music_cleanup.egg-info/PKG-INFO
+src/music_cleanup.egg-info/SOURCES.txt
+src/music_cleanup.egg-info/dependency_links.txt
+src/music_cleanup.egg-info/entry_points.txt
+src/music_cleanup.egg-info/requires.txt
+src/music_cleanup.egg-info/top_level.txt
