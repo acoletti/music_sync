@@ -30,8 +30,6 @@ from src.file_processor.factories.document import DefaultDocumentFactory
 from src.file_processor.factories.video import DefaultVideoFactory
 from src.file_processor.factories.file import FileFactory
 from src.file_processor.commands.preview import PreviewCommand
-from src.file_processor.models.media import MediaType
-from src.file_processor.media_processor import MediaProcessor
 
 @dataclass
 class FolderInfo:
@@ -529,19 +527,27 @@ def find_similar_folders(root_path: Path, fast_mode: bool = False) -> List[List[
     
     # Get all folders
     folders = []
-    for item in os.listdir(root_path):
-        item_path = root_path / item
-        if item_path.is_dir():
-            folders.append(FolderInfo(
-                path=item_path,
-                name=item,
-                size=get_folder_size(item_path),
-                file_count=count_files_in_folder(item_path),
-                files=get_folder_files(item_path)
-            ))
+    try:
+        for item in os.listdir(root_path):
+            item_path = root_path / item
+            if item_path.is_dir():
+                print(f"Found folder: {item_path}")
+                folders.append(FolderInfo(
+                    path=item_path,
+                    name=item,
+                    size=get_folder_size(item_path),
+                    file_count=count_files_in_folder(item_path),
+                    files=get_folder_files(item_path)
+                ))
+    except Exception as e:
+        print(f"Error scanning directory {root_path}: {e}")
+        return []
     
     if not folders:
+        print("No folders found in the directory!")
         return []
+    
+    print(f"\nFound {len(folders)} folders to process")
     
     # Calculate worker settings
     num_workers, chunk_size = calculate_worker_settings(len(folders), fast_mode)
@@ -579,12 +585,20 @@ def find_duplicate_tracks_across_folders(folder_group: List[Path]) -> Dict[str, 
         duplicate_tracks: Dict[str, List[Path]] = {}
         for name, paths in tracks_by_name.items():
             if len(paths) > 1:
-                # Further check if these are actual duplicates (e.g. by hash or size)
-                # For now, just matching by name
-                # We might want to ensure they are from different original folders if folder_group can contain subfolders of a processed unit
-                unique_parent_folders = {p.parent for p in paths}
-                if len(unique_parent_folders) > 1: # Ensure paths are from different main folders in the group
-                     duplicate_tracks[name] = paths
+                # Further check if these are actual duplicates by hash
+                hashes = {}
+                for path in paths:
+                    file_hash = calculate_file_hash_safe(path, 65536)
+                    if file_hash:
+                        if file_hash in hashes:
+                            hashes[file_hash].append(path)
+                        else:
+                            hashes[file_hash] = [path]
+                
+                # Check for duplicates by hash
+                for hash_value, hash_paths in hashes.items():
+                    if len(hash_paths) > 1:
+                        duplicate_tracks[name] = hash_paths
         return duplicate_tracks
     except PermissionError as e:
         print(f"\nError: Permission denied while scanning for duplicates: {e}")
@@ -638,15 +652,47 @@ def preview_changes(root_path: Path) -> List[str]:
 def get_music_folder_path(source_dir_arg: Optional[str]) -> Optional[Path]:
     """Get the music folder path from arguments or default location."""
     if source_dir_arg:
-        music_folder = Path(source_dir_arg).resolve()
-        if not music_folder.exists():
-            print(f"Error: Path '{music_folder}' does not exist.")
+        try:
+            # Convert mapped drive to network path if possible
+            if source_dir_arg.startswith('V:'):
+                # Try to get the network path for the V: drive
+                try:
+                    import win32api
+                    network_path = win32api.WNetGetConnection('V:')
+                    if network_path:
+                        source_dir_arg = source_dir_arg.replace('V:', network_path)
+                        print(f"Converted V: drive to network path: {source_dir_arg}")
+                except Exception as e:
+                    print(f"Warning: Could not convert V: drive to network path: {e}")
+            
+            music_folder = Path(source_dir_arg).resolve()
+            print(f"Checking path: {music_folder}")
+            
+            if not music_folder.exists():
+                print(f"Error: Path '{music_folder}' does not exist.")
+                return None
+                
+            if not music_folder.is_dir():
+                print(f"Error: Path '{music_folder}' is not a directory.")
+                return None
+                
+            # Test if we can list the directory contents
+            try:
+                test_list = list(music_folder.iterdir())
+                print(f"Successfully listed {len(test_list)} items in directory")
+                for item in test_list:
+                    print(f"Found: {item}")
+            except Exception as e:
+                print(f"Error accessing directory contents: {e}")
+                return None
+                
+            return music_folder
+            
+        except Exception as e:
+            print(f"Error processing path '{source_dir_arg}': {e}")
             return None
-        if not music_folder.is_dir():
-            print(f"Error: Path '{music_folder}' is not a directory.")
-            return None
-        return music_folder
     
+    # Default location logic
     d_drive = Path('/mnt/d')
     if not d_drive.exists():
         print("D: drive not found. Please make sure it's properly mounted or use --source-dir to specify a different location.")
@@ -674,18 +720,16 @@ class Command(ABC):
         pass
 
 class CleanupCommand(Command):
-    """Command for cleaning up media files."""
+    """Command for cleaning up music files."""
     def add_to_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument('-y', '--yes', action='store_true', 
                           help='Automatically answer yes to all prompts')
         parser.add_argument('--reset', action='store_true',
                           help='Reset progress and start fresh')
         parser.add_argument('--source-dir', type=str,
-                          help='Path to the media folder (absolute or relative)')
+                          help='Path to the music folder (absolute or relative)')
         parser.add_argument('--fast', action='store_true',
                           help='Run in fast mode with less thorough checks')
-        parser.add_argument('--media-type', type=str,
-                          help='Type of media to process (AUDIO, VIDEO, DOCUMENT)')
 
     def execute(self, args: argparse.Namespace) -> None:
         print("=== Starting music folder cleanup ===")
@@ -751,58 +795,19 @@ def process_music_folder(music_folder: Path, args: argparse.Namespace) -> Proces
     if args.reset:
         reset_processing_progress(config)
     
-    # Create media processor for the specified type
-    media_type = None
-    if args.media_type:
-        try:
-            media_type = MediaType[args.media_type.upper()]
-        except KeyError:
-            print(f"Invalid media type: {args.media_type}")
-            print("Valid types are: AUDIO, VIDEO, DOCUMENT")
-            return ProcessingResult([], 0, 0)
+    # Get all folders
+    folders = []
+    for item in os.listdir(music_folder):
+        item_path = music_folder / item
+        if item_path.is_dir():
+            folders.append([item_path])  # Each folder is its own group
     
-    media_processor = MediaProcessor(media_type)
-    
-    # Get all media files
-    files = media_processor.get_files(music_folder)
-    if not files:
-        print("No media files found!")
+    if not folders:
+        print("No folders found!")
         return ProcessingResult([], 0, 0)
     
-    print(f"\nFound {len(files)} media files")
-    
-    # Find duplicates
-    duplicates = media_processor.get_duplicates(files, fast=args.fast)
-    if not duplicates:
-        print("No duplicates found!")
-        return ProcessingResult([], len(files), 0)
-    
-    print(f"\nFound {len(duplicates)} groups of duplicate files")
-    
-    # Process duplicates
-    cleaned_count = 0
-    for name, group in duplicates.items():
-        print(f"\nProcessing group: {name}")
-        print(f"Found {len(group)} duplicate files")
-        
-        # Sort by size (largest first)
-        group.sort(key=lambda x: x.size, reverse=True)
-        
-        # Keep the largest file
-        keep_file = group[0]
-        print(f"Keeping: {keep_file.path} ({keep_file.size} bytes)")
-        
-        # Remove others
-        for file in group[1:]:
-            if args.yes or input(f"Remove {file.path} ({file.size} bytes)? [y/N] ").lower() == 'y':
-                try:
-                    file.path.unlink()
-                    print(f"Deleted: {file.path}")
-                    cleaned_count += 1
-                except Exception as e:
-                    print(f"Error removing {file.path}: {e}")
-    
-    return ProcessingResult([], len(files), cleaned_count)
+    print(f"\nFound {len(folders)} folders to process")
+    return process_similar_groups(folders, config, args.yes)
 
 def reset_processing_progress(config: FileProcessorConfig) -> None:
     """Reset the processing progress."""
@@ -872,97 +877,107 @@ def process_folder_batch(folder_pairs: list[tuple[Path, Path]], executor: Proces
             print(f"Error processing folder pair {p1}, {p2}: {e}")
     return results
 
+def find_and_clean_duplicates_within_folder(folder_path: Path, auto_yes: bool = False) -> int:
+    """Find and clean duplicate files within a folder."""
+    cleaned_count = 0
+    
+    print(f"\nChecking for duplicates in folder: {folder_path}")
+    
+    # List all files in the directory
+    try:
+        files = list(folder_path.iterdir())
+        print(f"Found {len(files)} items in directory:")
+        for f in files:
+            print(f"  - {f.name}")
+    except Exception as e:
+        print(f"Error listing directory contents: {e}")
+        return 0
+    
+    # Group files by their base name (ignoring (1), (2), etc.)
+    name_groups = {}
+    for file_path in folder_path.iterdir():
+        if not file_path.is_file() or file_path.name == 'desktop.ini':
+            continue
+            
+        # Normalize the name by removing (1), (2), etc. and any extra spaces
+        base_name = re.sub(r'\s*\(\d+\)(?:\s*\(\d+\))?$', '', file_path.stem).strip()
+        print(f"Processing file: {file_path.name}")
+        print(f"  Base name: {base_name}")
+        if base_name in name_groups:
+            name_groups[base_name].append(file_path)
+            print(f"  Added to existing group for: {base_name}")
+        else:
+            name_groups[base_name] = [file_path]
+            print(f"  Created new group for: {base_name}")
+    
+    # Check each group for duplicates
+    for base_name, paths in name_groups.items():
+        if len(paths) > 1:
+            print(f"\nFound potential duplicates for: {base_name}")
+            print(f"Files in group:")
+            for p in paths:
+                print(f"  - {p.name}")
+            # Calculate hashes for all files in the group
+            hash_map = {}
+            for path in paths:
+                print(f"Calculating hash for: {path.name}")
+                file_hash = calculate_file_hash_safe(path, 65536)
+                if file_hash:
+                    if file_hash in hash_map:
+                        hash_map[file_hash].append(path)
+                        print(f"  Hash matches existing group")
+                    else:
+                        hash_map[file_hash] = [path]
+                        print(f"  New hash group created")
+                else:
+                    print(f"  Failed to calculate hash")
+            
+            # Process each hash group
+            for file_hash, hash_paths in hash_map.items():
+                if len(hash_paths) > 1:
+                    print(f"\nDuplicate files found:")
+                    # Sort by size, keep the largest
+                    hash_paths.sort(key=lambda p: p.stat().st_size, reverse=True)
+                    keep_file = hash_paths[0]
+                    print(f"  Keeping: {keep_file} ({keep_file.stat().st_size} bytes)")
+                    
+                    for path in hash_paths[1:]:
+                        print(f"  Found duplicate: {path} ({path.stat().st_size} bytes)")
+                        if auto_yes or input(f"  Remove duplicate file {path}? (y/n): ").lower() == 'y':
+                            try:
+                                path.unlink()
+                                print(f"  Removed: {path}")
+                                cleaned_count += 1
+                            except Exception as e:
+                                print(f"  Error removing {path}: {e}")
+    
+    return cleaned_count
+
 def process_and_clean_group(folder_group: List[Path], config: FileProcessorConfig, auto_yes: bool) -> ProcessingResult:
     """Process and clean a group of similar folders."""
     processed_count = 0
     cleaned_count = 0
     
-    # Sort folders by number of files (keep the one with most files)
-    folder_sizes = [(path, count_files_in_folder(path)) for path in folder_group]
-    folder_sizes.sort(key=lambda x: x[1], reverse=True)
-    
-    keep_folder = folder_sizes[0][0]
-    print(f"\nKeeping folder: {keep_folder} with {folder_sizes[0][1]} files")
-    
-    # Find duplicate tracks across folders
-    try:
-        duplicate_tracks = find_duplicate_tracks_across_folders(folder_group)
-    except PermissionError as e:
-        print(f"\nError: Permission denied while scanning folders: {e}")
-        print("Try the following:")
-        print("1. Run the script as administrator")
-        print("2. Check network share permissions")
-        print("3. Ensure you have write access to the network share")
-        return ProcessingResult([folder_group], 0, 0)
-    
-    if duplicate_tracks:
-        print("\nDuplicate tracks found:")
-        for track_name, file_paths in duplicate_tracks.items():
-            print(f"\n  Track: {track_name}")
-            file_paths.sort(key=get_file_size, reverse=True)
+    print("\nProcessing folders:")
+    for folder in folder_group:
+        print(f"\n=== Processing folder: {folder} ===")
+        if not folder.exists():
+            print(f"Warning: Folder {folder} does not exist")
+            continue
+        if not folder.is_dir():
+            print(f"Warning: {folder} is not a directory")
+            continue
             
-            keep_file = file_paths[0]
-            print(f"    Keeping: {keep_file} ({get_file_size(keep_file)} bytes)")
-            
-            for file_path in file_paths[1:]:
-                if auto_yes or input(f"    Remove {file_path} ({get_file_size(file_path)} bytes)? [y/N] ").lower() == 'y':
-                    try:
-                        # Check if file is read-only
-                        if os.access(file_path, os.W_OK):
-                            file_path.unlink()
-                            print(f"    Removed: {file_path}")
-                            cleaned_count += 1
-                        else:
-                            print(f"    Error: No write permission for {file_path}")
-                            print("    Try running the script as administrator or check file permissions")
-                    except PermissionError:
-                        print(f"    Error: Permission denied for {file_path}")
-                        print("    Try running the script as administrator")
-                        print("    If this is a network share, ensure you have write access")
-                    except Exception as e:
-                        print(f"    Error removing {file_path}: {e}")
+        # Clean duplicates within the folder
+        try:
+            folder_cleaned = find_and_clean_duplicates_within_folder(folder, auto_yes)
+            cleaned_count += folder_cleaned
+            processed_count += 1
+            print(f"Processed folder: {folder}")
+            print(f"Items cleaned in this folder: {folder_cleaned}")
+        except Exception as e:
+            print(f"Error processing folder {folder}: {e}")
     
-    # Remove empty folders
-    for folder_path, file_count in folder_sizes[1:]:
-        if count_files_in_folder(folder_path) == 0:
-            if auto_yes or input(f"\nRemove empty folder {folder_path}? [y/N] ").lower() == 'y':
-                try:
-                    # Check if directory is writable
-                    if os.access(folder_path, os.W_OK):
-                        shutil.rmtree(folder_path)
-                        print(f"Removed folder: {folder_path}")
-                        cleaned_count += 1
-                    else:
-                        print(f"Error: No write permission for folder {folder_path}")
-                        print("Try running the script as administrator or check folder permissions")
-                except PermissionError:
-                    print(f"Error: Permission denied for folder {folder_path}")
-                    print("Try running the script as administrator")
-                    print("If this is a network share, ensure you have write access")
-                except Exception as e:
-                    print(f"Error removing folder {folder_path}: {e}")
-    
-    # After removing individual files, re-check folders that were not initially empty
-    for folder_path, _ in folder_sizes[1:]:
-        if folder_path.exists() and count_files_in_folder(folder_path) == 0:
-            if auto_yes or input(f"\nRemove folder {folder_path} (now empty after track deletions)? [y/N] ").lower() == 'y':
-                try:
-                    # Check if directory is writable
-                    if os.access(folder_path, os.W_OK):
-                        shutil.rmtree(folder_path)
-                        print(f"Removed folder (became empty): {folder_path}")
-                        cleaned_count += 1
-                    else:
-                        print(f"Error: No write permission for folder {folder_path}")
-                        print("Try running the script as administrator or check folder permissions")
-                except PermissionError:
-                    print(f"Error: Permission denied for folder {folder_path}")
-                    print("Try running the script as administrator")
-                    print("If this is a network share, ensure you have write access")
-                except Exception as e:
-                    print(f"Error removing folder (became empty) {folder_path}: {e}")
-
-    processed_count = len(folder_group)
     return ProcessingResult([folder_group], processed_count, cleaned_count)
 
 if __name__ == "__main__":

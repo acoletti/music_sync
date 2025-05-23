@@ -198,22 +198,11 @@ class MediaFactoryRegistry(FileFactoryRegistry):
             FileType.VIDEO: DefaultVideoFactory(),
             FileType.DOCUMENT: DefaultDocumentFactory()
         }
-        # Map MediaType to FileType
-        self._media_type_map = {
-            MediaType.AUDIO: FileType.AUDIO,
-            MediaType.VIDEO: FileType.VIDEO,
-            MediaType.DOCUMENT: FileType.DOCUMENT
-        }
 
-    def get_factory(self, media_type: Optional[MediaType] = None) -> Optional[FileFactory]:
+    def get_factory(self, media_type: MediaType):
         """Get the factory for a specific media type."""
-        if media_type is None:
-            return None
-        file_type = self._media_type_map.get(media_type)
-        if file_type is None:
-            return None
-        return self._factories.get(file_type)
+        return self._factories[media_type]
 
-    def get_all_factories(self) -> List[FileFactory]:
+    def get_all_factories(self) -> List:
         """Get all registered factories."""
         return list(self._factories.values()) 
